@@ -29,7 +29,17 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
+# Google retires Gemini models often (gemini-2.5-flash is gone), so if the chosen model fails
+# the app auto-discovers the newest Flash model available to your key, then tries these.
+FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.6-flash",
+    "gemini-flash-latest",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+]
+MAX_MODEL_TRIES = 6
 MAX_FILE_MB = 5
 MAX_PAGES = 10
 MAX_CHARS_TO_LLM = 20_000
@@ -357,16 +367,41 @@ def normalize_ai_result(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def call_gemini(api_key: str, model: str, prompt: str, retries: int = 2) -> dict[str, Any]:
-    from google import genai
-    from google.genai import types
+_FLASH_RE = re.compile(r"^(?:models/)?gemini-(\d+(?:\.\d+)*)-flash$")
 
-    client = genai.Client(api_key=api_key)
-    config = types.GenerateContentConfig(
-        temperature=0.2,
-        response_mime_type="application/json",
-    )
-    last_err: Exception | None = None
+
+def discover_flash_models(client: Any) -> list[str]:
+    """Ask the API which stable Flash models this key can use, newest first."""
+    try:
+        found: list[tuple[tuple[int, ...], str]] = []
+        for m in client.models.list():
+            name = getattr(m, "name", "") or ""
+            actions = getattr(m, "supported_actions", None)
+            if actions is not None and "generateContent" not in actions:
+                continue
+            match = _FLASH_RE.match(name)
+            if match:
+                version = tuple(int(x) for x in match.group(1).split("."))
+                found.append((version, name.split("/")[-1]))
+        found.sort(reverse=True)
+        return [n for _, n in found]
+    except Exception:
+        return []
+
+
+def _classify_error(exc: Exception | None) -> str:
+    msg = str(exc or "").lower()
+    if any(k in msg for k in ("api key", "api_key", "401", "403", "permission", "unauthenticated")):
+        return "auth"
+    if any(k in msg for k in ("no longer available", "not found", "404", "not supported")):
+        return "model"
+    if any(k in msg for k in ("429", "quota", "resource_exhausted", "rate limit")):
+        return "quota"
+    return "other"
+
+
+def _generate(client: Any, model: str, prompt: str, config: Any, retries: int) -> dict[str, Any]:
+    last: Exception | None = None
     for attempt in range(retries + 1):
         try:
             response = client.models.generate_content(model=model, contents=prompt, config=config)
@@ -374,26 +409,66 @@ def call_gemini(api_key: str, model: str, prompt: str, retries: int = 2) -> dict
             if not text:
                 raise ValueError("The model returned an empty response (it may have been blocked or truncated).")
             return normalize_ai_result(_parse_json(text))
-        except Exception as exc:  # network, quota, bad JSON, etc.
-            last_err = exc
-            msg = str(exc).lower()
-            # Don't retry auth / bad-request style errors
-            if any(k in msg for k in ("api key", "api_key", "permission", "invalid argument", "not found", "401", "403", "404")):
-                break
+        except Exception as exc:
+            last = exc
+            if _classify_error(exc) in ("auth", "model"):
+                raise  # retrying the same model/key will not help
             if attempt < retries:
                 time.sleep(1.5 * (attempt + 1))
-    raise RuntimeError(_friendly_error(last_err))
+    assert last is not None
+    raise last
 
 
-def _friendly_error(exc: Exception | None) -> str:
-    msg = str(exc or "").lower()
-    if "api key" in msg or "api_key" in msg or "401" in msg or "403" in msg or "permission" in msg:
+def call_gemini(api_key: str, model: str, prompt: str, retries: int = 2) -> tuple[dict[str, Any], str]:
+    """Run the analysis. Returns (result, model_actually_used).
+
+    If the requested model is retired / unavailable, automatically tries the newest Flash
+    models available to this key, then a static fallback list.
+    """
+    from google import genai
+    from google.genai import types
+
+    client = genai.Client(api_key=api_key)
+    config = types.GenerateContentConfig(response_mime_type="application/json")
+
+    candidates: list[str] = [(model or DEFAULT_MODEL).strip()]
+    extended = False
+    tried: list[str] = []
+    last_err: Exception | None = None
+    i = 0
+    while i < len(candidates) and i < MAX_MODEL_TRIES:
+        current = candidates[i]
+        i += 1
+        tried.append(current)
+        try:
+            return _generate(client, current, prompt, config, retries), current
+        except Exception as exc:
+            last_err = exc
+            kind = _classify_error(exc)
+            if kind not in ("model", "quota"):
+                break  # bad key, network problem, bad JSON... another model will not fix it
+            if not extended:
+                extended = True
+                for m in discover_flash_models(client)[:3] + FALLBACK_MODELS:
+                    if m not in candidates:
+                        candidates.append(m)
+    raise RuntimeError(_friendly_error(last_err, tried))
+
+
+def _friendly_error(exc: Exception | None, tried: list[str] | None = None) -> str:
+    kind = _classify_error(exc)
+    detail = str(exc or "")[:300]
+    tried_txt = f" (tried: {', '.join(tried)})" if tried else ""
+    if kind == "auth":
         return "Gemini rejected the API key. Check that it is correct and has access to the Gemini API."
-    if "not found" in msg or "404" in msg:
-        return "The selected Gemini model was not found. Try another model name in the sidebar (e.g. gemini-2.5-flash)."
-    if "429" in msg or "quota" in msg or "resource_exhausted" in msg or "rate" in msg:
-        return "Gemini rate limit / quota reached. Wait a minute and try again."
-    return f"The AI analysis failed: {exc}"
+    if kind == "model":
+        return (
+            f"No working Gemini model was found{tried_txt}. Google retires models often - open Google AI Studio, "
+            "check the current Flash model name, and enter it in the sidebar.\n\nDetails: " + detail
+        )
+    if kind == "quota":
+        return f"Gemini rate limit / quota reached{tried_txt}. Wait a minute and try again.\n\nDetails: {detail}"
+    return f"The AI analysis failed: {detail}"
 
 
 # --------------------------------------------------------------------------- #
@@ -462,6 +537,8 @@ def render_results(result: dict[str, Any]) -> None:
         st.markdown(f"### {icon} {label}")
         if ai["detected_role"]:
             st.caption(f"Detected target role: **{ai['detected_role']}**")
+        if result.get("model"):
+            st.caption(f"Analysed with `{result['model']}`")
     with c2:
         if ai["summary"]:
             st.info(ai["summary"])
@@ -543,7 +620,7 @@ def main() -> None:
             st.success("Gemini API key loaded.")
         else:
             api_key = st.text_input("Gemini API key", type="password", help="Get a free key at aistudio.google.com")
-        model = st.text_input("Gemini model", value=get_model_default())
+        model = st.text_input("Gemini model", value=get_model_default(), help="If this model is retired, the app auto-falls back to a working Flash model.")
         st.caption("Your resume is sent to Google's Gemini API for analysis and is not stored by this app.")
 
     col_a, col_b = st.columns(2)
@@ -569,8 +646,8 @@ def main() -> None:
                         text, pages = extract_resume_text(uploaded.name, data)
                         local = run_local_checks(text, pages)
                     with st.spinner("Analyzing with Gemini (10-30 seconds)..."):
-                        ai = call_gemini(api_key, model.strip() or DEFAULT_MODEL, build_prompt(text, jd))
-                    st.session_state["result"] = {"text": text, "local": local, "ai": ai}
+                        ai, used_model = call_gemini(api_key, model.strip() or DEFAULT_MODEL, build_prompt(text, jd))
+                    st.session_state["result"] = {"text": text, "local": local, "ai": ai, "model": used_model}
                 except ResumeError as exc:
                     st.session_state.pop("result", None)
                     st.error(str(exc))
