@@ -1,4 +1,3 @@
-# AI-ASSISTANT-2
 # 📄 ATS Resume Analyzer
 
 A Streamlit app that scores a resume for ATS (Applicant Tracking System) friendliness and suggests concrete improvements, powered by Google Gemini Flash.
@@ -41,7 +40,9 @@ streamlit run app.py
 
 You can also skip the environment variable and paste the key into the sidebar.
 
-Optional: set `GEMINI_MODEL` (default `gemini-2.5-flash`) to use a different Gemini Flash model.
+Optional: set `GEMINI_MODEL` (default `gemini-3.8-flash`) to use a different Gemini model.
+
+**Model auto-fallback:** Google retires Gemini models regularly (`gemini-2.5-flash` is no longer available). If the chosen model is retired or over quota, the app automatically looks up the newest Flash model your API key can use and retries. The model actually used is shown above the results. Current model names: <https://ai.google.dev/gemini-api/docs/models>
 
 ### Local secrets file (alternative)
 
@@ -49,7 +50,7 @@ Create `.streamlit/secrets.toml` (never commit it):
 
 ```toml
 GEMINI_API_KEY = "your_key_here"
-# GEMINI_MODEL = "gemini-2.5-flash"
+# GEMINI_MODEL = "gemini-3.8-flash"
 ```
 
 ## Push to GitHub
@@ -98,7 +99,7 @@ To update the app later, just `git push` - it redeploys automatically.
 | Problem | Fix |
 |---|---|
 | "Gemini rejected the API key" | Re-copy the key; make sure it's from Google AI Studio. |
-| "Model was not found" | Change the model in the sidebar (e.g. `gemini-2.5-flash`). |
+| "No working Gemini model was found" | Every fallback failed. Check the current Flash model name in Google AI Studio and type it in the sidebar. |
 | "Rate limit / quota reached" | Wait a minute; free-tier limits are low. |
 | "Almost no readable text" | The resume is a scanned image. Export a text-based PDF/DOCX. |
 | `ModuleNotFoundError` | Run `pip install -r requirements.txt` in your active environment. |
